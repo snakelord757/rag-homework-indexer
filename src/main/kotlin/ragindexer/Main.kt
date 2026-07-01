@@ -25,48 +25,11 @@ fun main(args: Array<String>) {
     }
 
     try {
-        val config = Cli.parse(args)
-        val workDir = Paths.get("").toAbsolutePath().normalize()
-        val document = findDocument(workDir, config.documentName)
-
-        println("Working directory: $workDir")
-        println("Document: $document")
-        println("Strategy: ${config.strategy}")
-        println("Ollama: ${config.ollamaUrl}, model: ${config.model}")
-
-        val extractor = DocumentExtractor()
-        val extracted = extractor.extract(document, config.pdfPages)
-        if (extracted.segments.none { it.text.isNotBlank() }) {
-            error("Document text is empty after extraction.")
+        when (args.firstOrNull()) {
+            "ask" -> runAsk(args.drop(1).toTypedArray())
+            "chat" -> runChat(args.drop(1).toTypedArray())
+            else -> runIndex(args)
         }
-
-        val ollama = OllamaEmbeddingClient(config.ollamaUrl, config.model)
-        val chunks = when (config.strategy) {
-            ChunkStrategy.FIXED -> FixedSizeChunker(config.fixedSize, config.overlap).chunk(extracted)
-            ChunkStrategy.SEMANTIC -> SemanticChunker(
-                ollama = ollama,
-                maxChunkChars = config.semanticMaxChars,
-                similarityThreshold = config.semanticSimilarityThreshold
-            ).chunk(extracted)
-        }.mapIndexed { index, chunk ->
-            chunk.copy(metadata = chunk.metadata.copy(chunkId = "chunk-${index + 1}"))
-        }
-
-        println("Chunks prepared: ${chunks.size}")
-        val embedded = chunks.mapIndexed { index, chunk ->
-            println("Embedding ${index + 1}/${chunks.size}: ${chunk.metadata.chunkId} (${chunk.text.length} chars)")
-            IndexedChunk(chunk.metadata, chunk.text, ollama.embed(chunk.text))
-        }
-
-        val output = jarDirectory().resolve("${document.fileNameWithoutExtension()}-index.json")
-        val index = IndexFile(
-            document = document.toAbsolutePath().normalize().toString(),
-            model = config.model,
-            strategy = config.strategy.cliName,
-            chunks = embedded
-        )
-        Files.writeString(output, JsonWriter.write(index), StandardCharsets.UTF_8)
-        println("Done. Index saved to: ${output.toAbsolutePath().normalize()}")
     } catch (ex: CliException) {
         System.err.println(ex.message)
         System.err.println()
@@ -76,6 +39,141 @@ fun main(args: Array<String>) {
         System.err.println("Error: ${ex.message}")
         kotlin.system.exitProcess(1)
     }
+}
+
+private fun runIndex(args: Array<String>) {
+    val config = Cli.parseIndex(args)
+    val workDir = Paths.get("").toAbsolutePath().normalize()
+    val document = findDocument(workDir, config.documentName)
+
+    println("Working directory: $workDir")
+    println("Document: $document")
+    println("Strategy: ${config.strategy}")
+    println("Ollama: ${config.ollamaUrl}, model: ${config.model}")
+
+    val extractor = DocumentExtractor()
+    val extracted = extractor.extract(document, config.pdfPages)
+    if (extracted.segments.none { it.text.isNotBlank() }) {
+        error("Document text is empty after extraction.")
+    }
+
+    val ollama = OllamaEmbeddingClient(config.ollamaUrl, config.model)
+    val chunks = when (config.strategy) {
+        ChunkStrategy.FIXED -> FixedSizeChunker(config.fixedSize, config.overlap).chunk(extracted)
+        ChunkStrategy.SEMANTIC -> SemanticChunker(
+            ollama = ollama,
+            maxChunkChars = config.semanticMaxChars,
+            similarityThreshold = config.semanticSimilarityThreshold
+        ).chunk(extracted)
+    }.mapIndexed { index, chunk ->
+        chunk.copy(metadata = chunk.metadata.copy(chunkId = "chunk-${index + 1}"))
+    }
+
+    println("Chunks prepared: ${chunks.size}")
+    val embedded = chunks.mapIndexed { index, chunk ->
+        println("Embedding ${index + 1}/${chunks.size}: ${chunk.metadata.chunkId} (${chunk.text.length} chars)")
+        IndexedChunk(chunk.metadata, chunk.text, ollama.embed(chunk.text))
+    }
+
+    val output = jarDirectory().resolve("${document.fileNameWithoutExtension()}-index.json")
+    val index = IndexFile(
+        document = document.toAbsolutePath().normalize().toString(),
+        model = config.model,
+        strategy = config.strategy.cliName,
+        chunks = embedded
+    )
+    Files.writeString(output, JsonWriter.write(index), StandardCharsets.UTF_8)
+    println("Done. Index saved to: ${output.toAbsolutePath().normalize()}")
+}
+
+private fun runAsk(args: Array<String>) {
+    val config = Cli.parseAsk(args)
+    val indexPath = Paths.get(config.indexPath).toAbsolutePath().normalize()
+    if (!Files.isRegularFile(indexPath)) error("Index file was not found: $indexPath")
+
+    val index = IndexReader.read(indexPath)
+    val embeddingModel = config.embeddingModel ?: index.model
+    val ollama = OllamaEmbeddingClient(config.ollamaUrl, embeddingModel)
+
+    println("Index: $indexPath")
+    println("Embedding model: $embeddingModel")
+    println("DeepSeek model: ${config.deepSeekModel}")
+
+    val apiKey = resolveDeepSeekApiKey(config.deepSeekApiKey)
+    val deepSeek = DeepSeekChatClient(config.deepSeekUrl, apiKey, config.deepSeekModel, config.temperature)
+
+    val questions = config.autoFile?.let(::readQuestionsFile) ?: listOf(config.question)
+    if (config.autoFile != null) println("Auto questions: ${questions.size}")
+
+    questions.forEachIndexed { questionIndex, question ->
+        if (questions.size > 1) {
+            println()
+            println("Question ${questionIndex + 1}/${questions.size}:")
+            println(question)
+        }
+        answerWithRag(question, index, ollama, deepSeek, config.topK)
+    }
+}
+
+private fun runChat(args: Array<String>) {
+    val config = Cli.parseChat(args)
+    val apiKey = resolveDeepSeekApiKey(config.deepSeekApiKey)
+
+    println("DeepSeek model: ${config.deepSeekModel}")
+    println("RAG: disabled")
+    println()
+
+    val deepSeek = DeepSeekChatClient(config.deepSeekUrl, apiKey, config.deepSeekModel, config.temperature)
+    val questions = config.autoFile?.let(::readQuestionsFile) ?: listOf(config.question)
+    if (config.autoFile != null) println("Auto questions: ${questions.size}")
+
+    questions.forEachIndexed { questionIndex, question ->
+        if (questions.size > 1) {
+            println()
+            println("Question ${questionIndex + 1}/${questions.size}:")
+            println(question)
+        }
+        val answer = deepSeek.chat(question)
+        println("Answer:")
+        println(answer.toConsoleSafeText())
+    }
+}
+
+private fun answerWithRag(
+    question: String,
+    index: IndexFile,
+    ollama: OllamaEmbeddingClient,
+    deepSeek: DeepSeekChatClient,
+    topK: Int
+) {
+    println("Searching relevant chunks...")
+
+    val results = searchRelevantChunks(question, index, ollama, topK)
+    if (results.isEmpty()) error("Index does not contain chunks.")
+
+    println("Top chunks:")
+    results.forEachIndexed { index, result ->
+        println("${index + 1}. ${result.chunk.metadata.chunkId}: ${"%.4f".format(result.score)}")
+    }
+    println()
+
+    val answer = deepSeek.answer(question, results)
+    println("Answer:")
+    println(answer.toConsoleSafeText())
+}
+
+private fun resolveDeepSeekApiKey(cliApiKey: String?): String {
+    val apiKey = cliApiKey
+        ?: System.getenv("DEEPSEEK_API_KEY")
+        ?: System.getenv("DEEPSEEK_KEY_API")
+        ?: readLocalProperty("DEEPSEEK_KEY_API")
+    if (apiKey.isNullOrBlank()) {
+        throw CliException(
+            "DeepSeek API key is required. Pass --deepseek-api-key, set DEEPSEEK_API_KEY/DEEPSEEK_KEY_API, " +
+                "or add DEEPSEEK_KEY_API to local.properties next to the jar."
+        )
+    }
+    return apiKey
 }
 
 private fun findDocument(workDir: Path, documentName: String): Path {
@@ -101,6 +199,51 @@ private fun jarDirectory(): Path {
     val location = Paths.get(source.location.toURI()).toAbsolutePath().normalize()
     return if (Files.isRegularFile(location)) location.parent else location
 }
+
+private fun readLocalProperty(key: String): String? {
+    val localProperties = jarDirectory().resolve("local.properties")
+    if (!Files.isRegularFile(localProperties)) return null
+
+    return Files.readAllLines(localProperties, StandardCharsets.UTF_8)
+        .asSequence()
+        .map { it.trim() }
+        .filter { it.isNotEmpty() && !it.startsWith("#") && !it.startsWith("!") }
+        .mapNotNull { line ->
+            val separator = line.indexOf('=').takeIf { it >= 0 } ?: line.indexOf(':').takeIf { it >= 0 }
+            if (separator == null) null else line.substring(0, separator).trim() to line.substring(separator + 1).trim()
+        }
+        .firstOrNull { (propertyKey, value) -> propertyKey == key && value.isNotBlank() }
+        ?.second
+}
+
+private fun readQuestionsFile(pathText: String): List<String> {
+    val path = Paths.get(pathText).toAbsolutePath().normalize()
+    if (!Files.isRegularFile(path)) error("Questions file was not found: $path")
+
+    val questions = Files.readAllLines(path, StandardCharsets.UTF_8)
+        .map { it.trim() }
+        .filter { it.isNotEmpty() && !it.startsWith("#") }
+
+    if (questions.isEmpty()) error("Questions file does not contain questions: $path")
+    return questions
+}
+
+private fun String.toConsoleSafeText(): String =
+    this
+        .replace('\u2018', '\'')
+        .replace('\u2019', '\'')
+        .replace('\u201A', '\'')
+        .replace('\u201B', '\'')
+        .replace('\u201C', '"')
+        .replace('\u201D', '"')
+        .replace('\u201E', '"')
+        .replace('\u201F', '"')
+        .replace('\u00AB', '"')
+        .replace('\u00BB', '"')
+        .replace('\u2013', '-')
+        .replace('\u2014', '-')
+        .replace('\u2212', '-')
+        .replace("\u2026", "...")
 
 private fun Path.fileNameWithoutExtension(): String {
     val file = fileName.toString()
@@ -130,10 +273,32 @@ data class CliConfig(
     val ollamaUrl: String
 )
 
+data class AskConfig(
+    val indexPath: String,
+    val question: String,
+    val autoFile: String?,
+    val topK: Int,
+    val embeddingModel: String?,
+    val ollamaUrl: String,
+    val deepSeekModel: String,
+    val deepSeekUrl: String,
+    val deepSeekApiKey: String?,
+    val temperature: Double
+)
+
+data class ChatConfig(
+    val question: String,
+    val autoFile: String?,
+    val deepSeekModel: String,
+    val deepSeekUrl: String,
+    val deepSeekApiKey: String?,
+    val temperature: Double
+)
+
 class CliException(message: String) : RuntimeException(message)
 
 object Cli {
-    fun parse(args: Array<String>): CliConfig {
+    fun parseIndex(args: Array<String>): CliConfig {
         if (args.isEmpty()) {
             throw CliException("Missing required arguments.")
         }
@@ -145,7 +310,7 @@ object Cli {
         var semanticMaxChars = 1600
         var semanticThreshold = 0.72
         var pages: Int? = null
-        var model = "nomic-embed-text"
+        var model = "qwen3-embedding"
         var ollamaUrl = "http://localhost:11434"
 
         var i = 0
@@ -186,16 +351,134 @@ object Cli {
         )
     }
 
+    fun parseAsk(args: Array<String>): AskConfig {
+        if (args.size < 2) {
+            throw CliException("Missing ask arguments.")
+        }
+
+        val positional = mutableListOf<String>()
+        var topK = 5
+        var embeddingModel: String? = null
+        var ollamaUrl = "http://localhost:11434"
+        var deepSeekModel = "deepseek-v4-flash"
+        var deepSeekUrl = "https://api.deepseek.com"
+        var deepSeekApiKey: String? = null
+        var temperature = 0.2
+
+        var i = 0
+        while (i < args.size) {
+            when (val arg = args[i]) {
+                "--top-k" -> topK = args.valueAfter(i++, arg).positiveInt(arg)
+                "--embed-model" -> embeddingModel = args.valueAfter(i++, arg)
+                "--ollama-url" -> ollamaUrl = args.valueAfter(i++, arg).trimEnd('/')
+                "--deepseek-model" -> deepSeekModel = args.valueAfter(i++, arg)
+                "--deepseek-url" -> deepSeekUrl = args.valueAfter(i++, arg).trimEnd('/')
+                "--deepseek-api-key" -> deepSeekApiKey = args.valueAfter(i++, arg)
+                "--temperature" -> temperature = args.valueAfter(i++, arg).toDoubleOrNull()
+                    ?: throw CliException("$arg must be a number.")
+                else -> {
+                    if (arg.startsWith("--")) throw CliException("Unknown option '$arg'.")
+                    positional += arg
+                }
+            }
+            i++
+        }
+
+        if (positional.size < 2) {
+            throw CliException("Usage for ask mode requires <index-json> and <question>, or <index-json> auto <file>.")
+        }
+        if (temperature !in 0.0..2.0) throw CliException("--temperature must be between 0 and 2.")
+        val autoFile = if (positional.getOrNull(1) == "auto") {
+            if (positional.size != 3) throw CliException("Usage for ask autopilot: ask <index-json> auto <questions-file>.")
+            positional[2]
+        } else {
+            null
+        }
+
+        return AskConfig(
+            indexPath = positional.first(),
+            question = if (autoFile == null) positional.drop(1).joinToString(" ") else "",
+            autoFile = autoFile,
+            topK = topK,
+            embeddingModel = embeddingModel,
+            ollamaUrl = ollamaUrl,
+            deepSeekModel = deepSeekModel,
+            deepSeekUrl = deepSeekUrl,
+            deepSeekApiKey = deepSeekApiKey,
+            temperature = temperature
+        )
+    }
+
+    fun parseChat(args: Array<String>): ChatConfig {
+        if (args.isEmpty()) {
+            throw CliException("Missing chat question.")
+        }
+
+        val positional = mutableListOf<String>()
+        var deepSeekModel = "deepseek-v4-flash"
+        var deepSeekUrl = "https://api.deepseek.com"
+        var deepSeekApiKey: String? = null
+        var temperature = 0.2
+
+        var i = 0
+        while (i < args.size) {
+            when (val arg = args[i]) {
+                "--deepseek-model" -> deepSeekModel = args.valueAfter(i++, arg)
+                "--deepseek-url" -> deepSeekUrl = args.valueAfter(i++, arg).trimEnd('/')
+                "--deepseek-api-key" -> deepSeekApiKey = args.valueAfter(i++, arg)
+                "--temperature" -> temperature = args.valueAfter(i++, arg).toDoubleOrNull()
+                    ?: throw CliException("$arg must be a number.")
+                else -> {
+                    if (arg.startsWith("--")) throw CliException("Unknown option '$arg'.")
+                    positional += arg
+                }
+            }
+            i++
+        }
+
+        if (positional.isEmpty()) throw CliException("Usage for chat mode requires <question>, or auto <questions-file>.")
+        if (temperature !in 0.0..2.0) throw CliException("--temperature must be between 0 and 2.")
+        val autoFile = if (positional.firstOrNull() == "auto") {
+            if (positional.size != 2) throw CliException("Usage for chat autopilot: chat auto <questions-file>.")
+            positional[1]
+        } else {
+            null
+        }
+
+        return ChatConfig(
+            question = if (autoFile == null) positional.joinToString(" ") else "",
+            autoFile = autoFile,
+            deepSeekModel = deepSeekModel,
+            deepSeekUrl = deepSeekUrl,
+            deepSeekApiKey = deepSeekApiKey,
+            temperature = temperature
+        )
+    }
+
     fun printUsage() {
         println(
             """
             Usage:
               java -jar rag-indexer.jar <document-name> --strategy fixed [--size 1200] [--overlap 150] [--pages N]
               java -jar rag-indexer.jar <document-name> --strategy semantic [--max-chars 1600] [--threshold 0.72] [--pages N]
+              java -jar rag-indexer.jar ask <index-json> "<question>" [--top-k 5] [--embed-model MODEL]
+              java -jar rag-indexer.jar ask <index-json> auto <questions-file> [--top-k 5]
+              java -jar rag-indexer.jar chat "<question>"
+              java -jar rag-indexer.jar chat auto <questions-file>
 
             Options:
-              --model MODEL          Ollama embedding model, default: nomic-embed-text
+              --model MODEL          Ollama embedding model, default: qwen3-embedding
               --ollama-url URL       Ollama base URL, default: http://localhost:11434
+
+            Ask options:
+              --embed-model MODEL        Ollama embedding model for the question, default: model from index
+              --deepseek-model MODEL     DeepSeek model, default: deepseek-v4-flash
+              --deepseek-url URL         DeepSeek base URL, default: https://api.deepseek.com
+              --deepseek-api-key KEY     DeepSeek API key, default: env variable or local.properties
+              --temperature NUMBER       DeepSeek temperature, default: 0.2
+
+            Chat mode sends the question directly to DeepSeek without RAG search.
+            Auto mode reads one question per line; empty lines and lines starting with # are skipped.
 
             The current console directory is used as the search root for the document.
             The resulting JSON index is written next to the jar file.
@@ -460,6 +743,133 @@ data class IndexFile(
     val chunks: List<IndexedChunk>
 )
 
+data class SearchResult(
+    val chunk: IndexedChunk,
+    val score: Double
+)
+
+private fun searchRelevantChunks(
+    question: String,
+    index: IndexFile,
+    ollama: OllamaEmbeddingClient,
+    topK: Int
+): List<SearchResult> {
+    val questionEmbedding = ollama.embed(question)
+    return index.chunks
+        .map { chunk -> SearchResult(chunk, cosine(questionEmbedding, chunk.embedding)) }
+        .sortedByDescending { it.score }
+        .take(topK)
+}
+
+class DeepSeekChatClient(
+    deepSeekUrl: String,
+    private val apiKey: String,
+    private val model: String,
+    private val temperature: Double
+) {
+    private val endpoint = URI.create("${deepSeekUrl.trimEnd('/')}/chat/completions")
+    private val client = HttpClient.newBuilder()
+        .connectTimeout(Duration.ofSeconds(10))
+        .build()
+
+    fun chat(question: String): String {
+        val systemPrompt = """
+            You are a helpful assistant. Answer in Russian unless the user asks for another language.
+        """.trimIndent()
+        return send(systemPrompt, question)
+    }
+
+    fun answer(question: String, results: List<SearchResult>): String {
+        val systemPrompt = """
+            You are a RAG assistant. Answer in Russian using only the provided context.
+            If the context is not enough, say that the index does not contain enough information.
+            Mention chunk ids when they support the answer.
+        """.trimIndent()
+        val userPrompt = buildUserPrompt(question, results)
+        return send(systemPrompt, userPrompt)
+    }
+
+    private fun send(systemPrompt: String, userPrompt: String): String {
+        val body = buildRequestBody(systemPrompt, userPrompt)
+
+        val request = HttpRequest.newBuilder(endpoint)
+            .timeout(Duration.ofMinutes(3))
+            .header("Content-Type", "application/json")
+            .header("Authorization", "Bearer $apiKey")
+            .POST(HttpRequest.BodyPublishers.ofString(body, StandardCharsets.UTF_8))
+            .build()
+
+        val response = client.send(request, HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8))
+        if (response.statusCode() !in 200..299) {
+            error("DeepSeek returned HTTP ${response.statusCode()}: ${response.body()}")
+        }
+        return readChatContent(response.body())
+    }
+
+    private fun buildUserPrompt(question: String, results: List<SearchResult>): String = buildString {
+        appendLine("Context chunks:")
+        results.forEachIndexed { index, result ->
+            val metadata = result.chunk.metadata
+            appendLine()
+            appendLine("[${index + 1}] ${metadata.chunkId}, score=${"%.4f".format(result.score)}")
+            appendLine("Title: ${metadata.title}")
+            if (metadata.section != null) appendLine("Section: ${metadata.section}")
+            appendLine(result.chunk.text)
+        }
+        appendLine()
+        appendLine("Question:")
+        appendLine(question)
+    }
+
+    private fun buildRequestBody(systemPrompt: String, userPrompt: String): String = buildString {
+        appendLine("{")
+        appendLine("  \"model\": \"${JsonWriter.escape(model)}\",")
+        appendLine("  \"messages\": [")
+        appendLine("    {\"role\": \"system\", \"content\": \"${JsonWriter.escape(systemPrompt)}\"},")
+        appendLine("    {\"role\": \"user\", \"content\": \"${JsonWriter.escape(userPrompt)}\"}")
+        appendLine("  ],")
+        appendLine("  \"temperature\": $temperature,")
+        appendLine("  \"stream\": false")
+        appendLine("}")
+    }
+
+    private fun readChatContent(json: String): String {
+        val root = JsonParser(json).parseObject()
+        val choices = root["choices"] as? List<*> ?: error("DeepSeek response does not contain choices.")
+        val first = choices.firstOrNull() as? Map<*, *> ?: error("DeepSeek response contains no choices.")
+        val message = first["message"] as? Map<*, *> ?: error("DeepSeek response does not contain message.")
+        return message["content"] as? String ?: error("DeepSeek response does not contain message content.")
+    }
+}
+
+object IndexReader {
+    fun read(path: Path): IndexFile {
+        val root = JsonParser(Files.readString(path, StandardCharsets.UTF_8)).parseObject()
+        val chunks = root.list("chunks").map { value ->
+            val chunk = value.asObject("chunk")
+            val metadata = chunk.obj("metadata")
+            IndexedChunk(
+                metadata = ChunkMetadata(
+                    source = metadata.string("source"),
+                    title = metadata.string("title"),
+                    section = metadata["section"] as? String,
+                    chunkId = metadata.string("chunk_id")
+                ),
+                text = chunk.string("text"),
+                embedding = chunk.list("embedding").map { number ->
+                    (number as? Number)?.toDouble() ?: error("Embedding value must be a number.")
+                }
+            )
+        }
+        return IndexFile(
+            document = root.string("document"),
+            model = root.string("model"),
+            strategy = root.string("strategy"),
+            chunks = chunks
+        )
+    }
+}
+
 object JsonWriter {
     fun write(index: IndexFile): String = buildString {
         appendLine("{")
@@ -538,3 +948,170 @@ object JsonWriter {
         return -1
     }
 }
+
+private class JsonParser(private val json: String) {
+    private var index = 0
+
+    @Suppress("UNCHECKED_CAST")
+    fun parseObject(): Map<String, Any?> {
+        val value = parseValue()
+        skipWhitespace()
+        if (index != json.length) error("Unexpected trailing JSON content at position $index.")
+        return value as? Map<String, Any?> ?: error("JSON root must be an object.")
+    }
+
+    private fun parseValue(): Any? {
+        skipWhitespace()
+        if (index >= json.length) error("Unexpected end of JSON.")
+        return when (json[index]) {
+            '{' -> parseObjectValue()
+            '[' -> parseArray()
+            '"' -> parseString()
+            't' -> parseLiteral("true", true)
+            'f' -> parseLiteral("false", false)
+            'n' -> parseLiteral("null", null)
+            '-', in '0'..'9' -> parseNumber()
+            else -> error("Unexpected character '${json[index]}' at position $index.")
+        }
+    }
+
+    private fun parseObjectValue(): Map<String, Any?> {
+        expect('{')
+        skipWhitespace()
+        val result = linkedMapOf<String, Any?>()
+        if (peek('}')) {
+            index++
+            return result
+        }
+
+        while (true) {
+            val key = parseString()
+            skipWhitespace()
+            expect(':')
+            result[key] = parseValue()
+            skipWhitespace()
+            when {
+                peek(',') -> index++
+                peek('}') -> {
+                    index++
+                    return result
+                }
+                else -> error("Expected ',' or '}' at position $index.")
+            }
+        }
+    }
+
+    private fun parseArray(): List<Any?> {
+        expect('[')
+        skipWhitespace()
+        val result = mutableListOf<Any?>()
+        if (peek(']')) {
+            index++
+            return result
+        }
+
+        while (true) {
+            result += parseValue()
+            skipWhitespace()
+            when {
+                peek(',') -> index++
+                peek(']') -> {
+                    index++
+                    return result
+                }
+                else -> error("Expected ',' or ']' at position $index.")
+            }
+        }
+    }
+
+    private fun parseString(): String {
+        expect('"')
+        val result = StringBuilder()
+        while (index < json.length) {
+            val ch = json[index++]
+            when (ch) {
+                '"' -> return result.toString()
+                '\\' -> {
+                    if (index >= json.length) error("Unfinished escape sequence.")
+                    result.append(
+                        when (val escaped = json[index++]) {
+                            '"' -> '"'
+                            '\\' -> '\\'
+                            '/' -> '/'
+                            'b' -> '\b'
+                            'f' -> '\u000C'
+                            'n' -> '\n'
+                            'r' -> '\r'
+                            't' -> '\t'
+                            'u' -> parseUnicodeEscape()
+                            else -> error("Unsupported escape sequence '\\$escaped'.")
+                        }
+                    )
+                }
+                else -> result.append(ch)
+            }
+        }
+        error("Unterminated JSON string.")
+    }
+
+    private fun parseUnicodeEscape(): Char {
+        if (index + 4 > json.length) error("Invalid unicode escape.")
+        val hex = json.substring(index, index + 4)
+        index += 4
+        return hex.toIntOrNull(16)?.toChar() ?: error("Invalid unicode escape: $hex")
+    }
+
+    private fun parseNumber(): Double {
+        val start = index
+        if (peek('-')) index++
+        readDigits()
+        if (peek('.')) {
+            index++
+            readDigits()
+        }
+        if (index < json.length && (json[index] == 'e' || json[index] == 'E')) {
+            index++
+            if (index < json.length && (json[index] == '+' || json[index] == '-')) index++
+            readDigits()
+        }
+        return json.substring(start, index).toDoubleOrNull()
+            ?: error("Invalid number at position $start.")
+    }
+
+    private fun readDigits() {
+        val start = index
+        while (index < json.length && json[index].isDigit()) index++
+        if (start == index) error("Expected digit at position $index.")
+    }
+
+    private fun parseLiteral(literal: String, value: Any?): Any? {
+        if (!json.startsWith(literal, index)) error("Expected '$literal' at position $index.")
+        index += literal.length
+        return value
+    }
+
+    private fun expect(ch: Char) {
+        skipWhitespace()
+        if (!peek(ch)) error("Expected '$ch' at position $index.")
+        index++
+    }
+
+    private fun peek(ch: Char): Boolean = index < json.length && json[index] == ch
+
+    private fun skipWhitespace() {
+        while (index < json.length && json[index].isWhitespace()) index++
+    }
+}
+
+private fun Map<String, Any?>.string(key: String): String =
+    this[key] as? String ?: error("JSON field '$key' must be a string.")
+
+private fun Map<String, Any?>.obj(key: String): Map<String, Any?> =
+    this[key].asObject(key)
+
+private fun Map<String, Any?>.list(key: String): List<Any?> =
+    this[key] as? List<*> ?: error("JSON field '$key' must be an array.")
+
+@Suppress("UNCHECKED_CAST")
+private fun Any?.asObject(name: String): Map<String, Any?> =
+    this as? Map<String, Any?> ?: error("JSON field '$name' must be an object.")

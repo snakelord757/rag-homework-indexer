@@ -22,12 +22,12 @@ java -jar D:\RagHomework\build\libs\rag-indexer.jar document.pdf --strategy fixe
 java -jar D:\RagHomework\build\libs\rag-indexer.jar notes.md --strategy semantic --max-chars 1600 --threshold 0.72
 ```
 
-По умолчанию используется Ollama `http://localhost:11434` и модель `nomic-embed-text`.
+По умолчанию используется Ollama `http://localhost:11434` и модель `qwen3-embedding`.
 
 Перед запуском убедитесь, что Ollama поднята и модель загружена:
 
 ```powershell
-ollama pull nomic-embed-text
+ollama pull qwen3-embedding
 ollama serve
 ```
 
