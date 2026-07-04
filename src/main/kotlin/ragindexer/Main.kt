@@ -111,7 +111,21 @@ private fun runAsk(args: Array<String>) {
             println("Question ${questionIndex + 1}/${questions.size}:")
             println(question)
         }
-        answerWithRag(question, index, ollama, deepSeek, config.topK)
+        answerWithRag(
+            question = question,
+            indexes = listOf(
+                LoadedIndex(
+                    path = indexPath,
+                    index = index,
+                    embeddingModel = embeddingModel,
+                    ollama = ollama
+                )
+            ),
+            deepSeek = deepSeek,
+            searchTopK = config.searchTopK,
+            topK = config.topK,
+            relevanceThreshold = config.relevanceThreshold
+        )
     }
 }
 
@@ -120,12 +134,40 @@ private fun runChat(args: Array<String>) {
     val apiKey = resolveDeepSeekApiKey(config.deepSeekApiKey)
 
     println("DeepSeek model: ${config.deepSeekModel}")
-    println("RAG: disabled")
-    println()
-
     val deepSeek = DeepSeekChatClient(config.deepSeekUrl, apiKey, config.deepSeekModel, config.temperature)
     val questions = config.autoFile?.let(::readQuestionsFile) ?: listOf(config.question)
     if (config.autoFile != null) println("Auto questions: ${questions.size}")
+
+    if (config.ragEnabled) {
+        val indexes = loadRagIndexes(config)
+
+        println("RAG: enabled")
+        println("Indexes: ${indexes.size}")
+        indexes.forEach { loaded ->
+            println("- ${loaded.path}: model=${loaded.embeddingModel}, chunks=${loaded.index.chunks.size}")
+        }
+        println()
+
+        questions.forEachIndexed { questionIndex, question ->
+            if (questions.size > 1) {
+                println()
+                println("Question ${questionIndex + 1}/${questions.size}:")
+                println(question)
+            }
+            answerWithRag(
+                question = question,
+                indexes = indexes,
+                deepSeek = deepSeek,
+                searchTopK = config.searchTopK,
+                topK = config.topK,
+                relevanceThreshold = config.relevanceThreshold
+            )
+        }
+        return
+    }
+
+    println("RAG: disabled")
+    println()
 
     questions.forEachIndexed { questionIndex, question ->
         if (questions.size > 1) {
@@ -139,23 +181,88 @@ private fun runChat(args: Array<String>) {
     }
 }
 
+private fun loadRagIndexes(config: ChatConfig): List<LoadedIndex> {
+    val paths = if (config.indexPath != null) {
+        listOf(Paths.get(config.indexPath).toAbsolutePath().normalize())
+    } else {
+        discoverIndexFiles()
+    }
+    if (paths.isEmpty()) error("No *-index.json files were found next to the jar or in the current directory.")
+
+    return paths.map { path ->
+        if (!Files.isRegularFile(path)) error("Index file was not found: $path")
+        val index = IndexReader.read(path)
+        val embeddingModel = config.embeddingModel ?: index.model
+        LoadedIndex(
+            path = path,
+            index = index,
+            embeddingModel = embeddingModel,
+            ollama = OllamaEmbeddingClient(config.ollamaUrl, embeddingModel)
+        )
+    }
+}
+
+private fun discoverIndexFiles(): List<Path> {
+    val roots = listOf(jarDirectory(), Paths.get("").toAbsolutePath().normalize()).distinct()
+    return roots
+        .flatMap { root ->
+            if (!Files.isDirectory(root)) {
+                emptyList()
+            } else {
+                Files.list(root).use { stream ->
+                    stream
+                        .filter { Files.isRegularFile(it) }
+                        .filter { it.fileName.toString().endsWith("-index.json", ignoreCase = true) }
+                        .map { it.toAbsolutePath().normalize() }
+                        .toList()
+                }
+            }
+        }
+        .distinct()
+        .sorted()
+}
+
 private fun answerWithRag(
     question: String,
-    index: IndexFile,
-    ollama: OllamaEmbeddingClient,
+    indexes: List<LoadedIndex>,
     deepSeek: DeepSeekChatClient,
-    topK: Int
+    searchTopK: Int,
+    topK: Int,
+    relevanceThreshold: Double
 ) {
     println("Searching relevant chunks...")
+    println("Retrieval settings: searchTopK=$searchTopK, finalTopK=$topK, rerankThreshold=${"%.4f".format(relevanceThreshold)}")
 
-    val results = searchRelevantChunks(question, index, ollama, topK)
-    if (results.isEmpty()) error("Index does not contain chunks.")
+    if (indexes.all { it.index.chunks.isEmpty() }) {
+        println("Answer:")
+        println("Не знаю")
+        return
+    }
 
-    println("Top chunks:")
+    val retrieved = searchRelevantChunks(question, indexes, searchTopK)
+    if (retrieved.isEmpty()) {
+        println("Answer:")
+        println("Не знаю")
+        return
+    }
+
+    println("Top chunks before DeepSeek reranker:")
+    retrieved.forEachIndexed { index, result ->
+        println("${index + 1}. ${result.chunk.metadata.chunkId}: embedding=${"%.4f".format(result.score)}")
+    }
+
+    val results = deepSeek.rerank(question, retrieved, relevanceThreshold, topK)
+    println("Top chunks after DeepSeek reranker:")
     results.forEachIndexed { index, result ->
-        println("${index + 1}. ${result.chunk.metadata.chunkId}: ${"%.4f".format(result.score)}")
+        println("${index + 1}. ${result.chunk.metadata.chunkId}: rerank=${"%.4f".format(result.score)}")
     }
     println()
+
+    if (results.isEmpty()) {
+        println("Answer:")
+        println("Не знаю")
+        return
+    }
 
     val answer = deepSeek.answer(question, results)
     println("Answer:")
@@ -277,7 +384,9 @@ data class AskConfig(
     val indexPath: String,
     val question: String,
     val autoFile: String?,
+    val searchTopK: Int,
     val topK: Int,
+    val relevanceThreshold: Double,
     val embeddingModel: String?,
     val ollamaUrl: String,
     val deepSeekModel: String,
@@ -287,12 +396,26 @@ data class AskConfig(
 )
 
 data class ChatConfig(
+    val ragEnabled: Boolean,
+    val indexPath: String?,
     val question: String,
     val autoFile: String?,
+    val searchTopK: Int,
+    val topK: Int,
+    val relevanceThreshold: Double,
+    val embeddingModel: String?,
+    val ollamaUrl: String,
     val deepSeekModel: String,
     val deepSeekUrl: String,
     val deepSeekApiKey: String?,
     val temperature: Double
+)
+
+data class LoadedIndex(
+    val path: Path,
+    val index: IndexFile,
+    val embeddingModel: String,
+    val ollama: OllamaEmbeddingClient
 )
 
 class CliException(message: String) : RuntimeException(message)
@@ -358,6 +481,8 @@ object Cli {
 
         val positional = mutableListOf<String>()
         var topK = 5
+        var searchTopK: Int? = null
+        var relevanceThreshold = 0.6
         var embeddingModel: String? = null
         var ollamaUrl = "http://localhost:11434"
         var deepSeekModel = "deepseek-v4-flash"
@@ -369,6 +494,9 @@ object Cli {
         while (i < args.size) {
             when (val arg = args[i]) {
                 "--top-k" -> topK = args.valueAfter(i++, arg).positiveInt(arg)
+                "--search-top-k" -> searchTopK = args.valueAfter(i++, arg).positiveInt(arg)
+                "--rerank-threshold", "--similarity-threshold" -> relevanceThreshold = args.valueAfter(i++, arg).toDoubleOrNull()
+                    ?: throw CliException("$arg must be a number.")
                 "--embed-model" -> embeddingModel = args.valueAfter(i++, arg)
                 "--ollama-url" -> ollamaUrl = args.valueAfter(i++, arg).trimEnd('/')
                 "--deepseek-model" -> deepSeekModel = args.valueAfter(i++, arg)
@@ -388,6 +516,9 @@ object Cli {
             throw CliException("Usage for ask mode requires <index-json> and <question>, or <index-json> auto <file>.")
         }
         if (temperature !in 0.0..2.0) throw CliException("--temperature must be between 0 and 2.")
+        if (relevanceThreshold !in 0.0..1.0) throw CliException("--rerank-threshold must be between 0.0 and 1.0.")
+        val effectiveSearchTopK = searchTopK ?: topK * 3
+        if (effectiveSearchTopK < topK) throw CliException("--search-top-k must be greater than or equal to --top-k.")
         val autoFile = if (positional.getOrNull(1) == "auto") {
             if (positional.size != 3) throw CliException("Usage for ask autopilot: ask <index-json> auto <questions-file>.")
             positional[2]
@@ -399,7 +530,9 @@ object Cli {
             indexPath = positional.first(),
             question = if (autoFile == null) positional.drop(1).joinToString(" ") else "",
             autoFile = autoFile,
+            searchTopK = effectiveSearchTopK,
             topK = topK,
+            relevanceThreshold = relevanceThreshold,
             embeddingModel = embeddingModel,
             ollamaUrl = ollamaUrl,
             deepSeekModel = deepSeekModel,
@@ -415,6 +548,12 @@ object Cli {
         }
 
         val positional = mutableListOf<String>()
+        var ragEnabled = true
+        var topK = 5
+        var searchTopK: Int? = null
+        var relevanceThreshold = 0.6
+        var embeddingModel: String? = null
+        var ollamaUrl = "http://localhost:11434"
         var deepSeekModel = "deepseek-v4-flash"
         var deepSeekUrl = "https://api.deepseek.com"
         var deepSeekApiKey: String? = null
@@ -423,6 +562,13 @@ object Cli {
         var i = 0
         while (i < args.size) {
             when (val arg = args[i]) {
+                "--no-rag" -> ragEnabled = false
+                "--top-k" -> topK = args.valueAfter(i++, arg).positiveInt(arg)
+                "--search-top-k" -> searchTopK = args.valueAfter(i++, arg).positiveInt(arg)
+                "--rerank-threshold", "--similarity-threshold" -> relevanceThreshold = args.valueAfter(i++, arg).toDoubleOrNull()
+                    ?: throw CliException("$arg must be a number.")
+                "--embed-model" -> embeddingModel = args.valueAfter(i++, arg)
+                "--ollama-url" -> ollamaUrl = args.valueAfter(i++, arg).trimEnd('/')
                 "--deepseek-model" -> deepSeekModel = args.valueAfter(i++, arg)
                 "--deepseek-url" -> deepSeekUrl = args.valueAfter(i++, arg).trimEnd('/')
                 "--deepseek-api-key" -> deepSeekApiKey = args.valueAfter(i++, arg)
@@ -436,18 +582,41 @@ object Cli {
             i++
         }
 
-        if (positional.isEmpty()) throw CliException("Usage for chat mode requires <question>, or auto <questions-file>.")
         if (temperature !in 0.0..2.0) throw CliException("--temperature must be between 0 and 2.")
-        val autoFile = if (positional.firstOrNull() == "auto") {
-            if (positional.size != 2) throw CliException("Usage for chat autopilot: chat auto <questions-file>.")
-            positional[1]
+        if (relevanceThreshold !in 0.0..1.0) throw CliException("--rerank-threshold must be between 0.0 and 1.0.")
+        val effectiveSearchTopK = searchTopK ?: topK * 3
+        if (effectiveSearchTopK < topK) throw CliException("--search-top-k must be greater than or equal to --top-k.")
+
+        val indexPath = if (ragEnabled && positional.firstOrNull()?.endsWith("-index.json", ignoreCase = true) == true) {
+            positional.first()
+        } else {
+            null
+        }
+        val questionArgs = if (indexPath != null) positional.drop(1) else positional
+        if (questionArgs.isEmpty()) throw CliException("Usage for chat mode requires <question>, or auto <questions-file>.")
+        val autoFile = if (questionArgs.firstOrNull() == "auto") {
+            if (questionArgs.size != 2) throw CliException(
+                if (ragEnabled) {
+                    "Usage for chat autopilot: chat [<index-json>] auto <questions-file>."
+                } else {
+                    "Usage for chat without RAG autopilot: chat --no-rag auto <questions-file>."
+                }
+            )
+            questionArgs[1]
         } else {
             null
         }
 
         return ChatConfig(
-            question = if (autoFile == null) positional.joinToString(" ") else "",
+            ragEnabled = ragEnabled,
+            indexPath = indexPath,
+            question = if (autoFile == null) questionArgs.joinToString(" ") else "",
             autoFile = autoFile,
+            searchTopK = effectiveSearchTopK,
+            topK = topK,
+            relevanceThreshold = relevanceThreshold,
+            embeddingModel = embeddingModel,
+            ollamaUrl = ollamaUrl,
             deepSeekModel = deepSeekModel,
             deepSeekUrl = deepSeekUrl,
             deepSeekApiKey = deepSeekApiKey,
@@ -461,23 +630,32 @@ object Cli {
             Usage:
               java -jar rag-indexer.jar <document-name> --strategy fixed [--size 1200] [--overlap 150] [--pages N]
               java -jar rag-indexer.jar <document-name> --strategy semantic [--max-chars 1600] [--threshold 0.72] [--pages N]
-              java -jar rag-indexer.jar ask <index-json> "<question>" [--top-k 5] [--embed-model MODEL]
-              java -jar rag-indexer.jar ask <index-json> auto <questions-file> [--top-k 5]
+              java -jar rag-indexer.jar ask <index-json> "<question>" [--search-top-k 15] [--top-k 5] [--rerank-threshold 0.6] [--embed-model MODEL]
+              java -jar rag-indexer.jar ask <index-json> auto <questions-file> [--search-top-k 15] [--top-k 5] [--rerank-threshold 0.6]
               java -jar rag-indexer.jar chat "<question>"
               java -jar rag-indexer.jar chat auto <questions-file>
+              java -jar rag-indexer.jar chat <index-json> "<question>"
+              java -jar rag-indexer.jar chat <index-json> auto <questions-file>
+              java -jar rag-indexer.jar chat --no-rag "<question>"
+              java -jar rag-indexer.jar chat --no-rag auto <questions-file>
 
             Options:
               --model MODEL          Ollama embedding model, default: qwen3-embedding
               --ollama-url URL       Ollama base URL, default: http://localhost:11434
 
             Ask options:
+              --search-top-k N          Chunks to retrieve before DeepSeek reranking, default: --top-k * 3
+              --top-k N                 Chunks to keep after DeepSeek reranking, default: 5
+              --rerank-threshold N      Minimum DeepSeek relevance score, default: 0.6
               --embed-model MODEL        Ollama embedding model for the question, default: model from index
               --deepseek-model MODEL     DeepSeek model, default: deepseek-v4-flash
               --deepseek-url URL         DeepSeek base URL, default: https://api.deepseek.com
               --deepseek-api-key KEY     DeepSeek API key, default: env variable or local.properties
               --temperature NUMBER       DeepSeek temperature, default: 0.2
 
-            Chat mode sends the question directly to DeepSeek without RAG search.
+            Chat mode uses all discovered *-index.json files by default.
+            Index discovery checks the jar directory and the current console directory.
+            Use --no-rag before the question to send it directly to DeepSeek.
             Auto mode reads one question per line; empty lines and lines starting with # are skipped.
 
             The current console directory is used as the search root for the document.
@@ -761,6 +939,21 @@ private fun searchRelevantChunks(
         .take(topK)
 }
 
+private fun searchRelevantChunks(
+    question: String,
+    indexes: List<LoadedIndex>,
+    topK: Int
+): List<SearchResult> =
+    indexes
+        .flatMap { loaded ->
+            val questionEmbedding = loaded.ollama.embed(question)
+            loaded.index.chunks.map { chunk ->
+                SearchResult(chunk, cosine(questionEmbedding, chunk.embedding))
+            }
+        }
+        .sortedByDescending { it.score }
+        .take(topK)
+
 class DeepSeekChatClient(
     deepSeekUrl: String,
     private val apiKey: String,
@@ -779,18 +972,117 @@ class DeepSeekChatClient(
         return send(systemPrompt, question)
     }
 
+    fun rerank(
+        question: String,
+        results: List<SearchResult>,
+        relevanceThreshold: Double,
+        topK: Int
+    ): List<SearchResult> {
+        val systemPrompt = """
+            You are a relevance reranker for a RAG system.
+            Score each candidate chunk from 0.0 to 1.0 by how useful it is for answering the question.
+            Use only these scores: 0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0.
+            Use the same score for the same question and chunk text across runs.
+            Return only valid JSON with this shape: {"scores":[{"chunk_id":"chunk-1","score":0.92}]}.
+            Include every provided chunk id exactly once. Do not add explanations.
+        """.trimIndent()
+        val response = send(systemPrompt, buildRerankPrompt(question, results), RERANK_TEMPERATURE)
+        val scores = readRerankScores(response)
+        val embeddingScores = results.associate { it.chunk.metadata.chunkId to it.score }
+
+        return results
+            .map { result ->
+                SearchResult(result.chunk, scores[result.chunk.metadata.chunkId] ?: 0.0)
+            }
+            .sortedWith(
+                compareByDescending<SearchResult> { it.score }
+                    .thenByDescending { embeddingScores[it.chunk.metadata.chunkId] ?: 0.0 }
+                    .thenBy { it.chunk.metadata.chunkId }
+            )
+            .filter { it.score >= relevanceThreshold }
+            .take(topK)
+    }
+
     fun answer(question: String, results: List<SearchResult>): String {
         val systemPrompt = """
             You are a RAG assistant. Answer in Russian using only the provided context.
-            If the context is not enough, say that the index does not contain enough information.
-            Mention chunk ids when they support the answer.
+            If the provided context is missing, irrelevant, ambiguous, or not enough to answer confidently, answer exactly: Не знаю
+            Do not add explanations when answering Не знаю.
+            Every factual statement in a non-empty answer must be supported by a direct quote from the context.
+            Always include the source chunk id next to each quote, for example: "quoted text" (chunk-3).
+            Do not answer from general knowledge. If you cannot quote a relevant chunk, answer exactly: Не знаю
+            Use this format:
+            Ответ: <short answer with inline quotes and chunk ids>
+            Цитаты:
+            - "..." (chunk-id)
         """.trimIndent()
         val userPrompt = buildUserPrompt(question, results)
         return send(systemPrompt, userPrompt)
     }
 
-    private fun send(systemPrompt: String, userPrompt: String): String {
-        val body = buildRequestBody(systemPrompt, userPrompt)
+    private fun buildRerankPrompt(question: String, results: List<SearchResult>): String = buildString {
+        appendLine("Question:")
+        appendLine(question)
+        appendLine()
+        appendLine("Candidate chunks:")
+        results.forEachIndexed { index, result ->
+            val metadata = result.chunk.metadata
+            appendLine()
+            appendLine("[${index + 1}] chunk_id=${metadata.chunkId}, embedding_score=${"%.4f".format(result.score)}")
+            appendLine("Title: ${metadata.title}")
+            if (metadata.section != null) appendLine("Section: ${metadata.section}")
+            appendLine("Text:")
+            appendLine(result.chunk.text.take(RERANK_TEXT_LIMIT))
+        }
+    }
+
+    private fun readRerankScores(content: String): Map<String, Double> {
+        val root = JsonParser(extractJsonObject(content)).parseObject()
+        return root.list("scores").associate { value ->
+            val item = value.asObject("scores item")
+            val chunkId = item.string("chunk_id")
+            val score = (item["score"] as? Number)?.toDouble()
+                ?: error("DeepSeek reranker score for $chunkId must be a number.")
+            chunkId to score.coerceIn(0.0, 1.0)
+        }
+    }
+
+    private fun extractJsonObject(content: String): String {
+        val start = content.indexOf('{')
+        if (start < 0) error("DeepSeek reranker did not return a JSON object: $content")
+
+        var depth = 0
+        var inString = false
+        var escaped = false
+        for (i in start until content.length) {
+            val ch = content[i]
+            if (inString) {
+                when {
+                    escaped -> escaped = false
+                    ch == '\\' -> escaped = true
+                    ch == '"' -> inString = false
+                }
+            } else {
+                when (ch) {
+                    '"' -> inString = true
+                    '{' -> depth++
+                    '}' -> {
+                        depth--
+                        if (depth == 0) return content.substring(start, i + 1)
+                    }
+                }
+            }
+        }
+        error("DeepSeek reranker returned malformed JSON: $content")
+    }
+
+    private companion object {
+        const val RERANK_TEXT_LIMIT = 1800
+        const val RERANK_TEMPERATURE = 0.0
+    }
+
+    private fun send(systemPrompt: String, userPrompt: String, requestTemperature: Double = temperature): String {
+        val body = buildRequestBody(systemPrompt, userPrompt, requestTemperature)
 
         val request = HttpRequest.newBuilder(endpoint)
             .timeout(Duration.ofMinutes(3))
@@ -811,24 +1103,27 @@ class DeepSeekChatClient(
         results.forEachIndexed { index, result ->
             val metadata = result.chunk.metadata
             appendLine()
-            appendLine("[${index + 1}] ${metadata.chunkId}, score=${"%.4f".format(result.score)}")
+            appendLine("[${index + 1}] chunk_id=${metadata.chunkId}, score=${"%.4f".format(result.score)}")
             appendLine("Title: ${metadata.title}")
             if (metadata.section != null) appendLine("Section: ${metadata.section}")
+            appendLine("Text:")
             appendLine(result.chunk.text)
         }
         appendLine()
         appendLine("Question:")
         appendLine(question)
+        appendLine()
+        appendLine("Remember: answer must include direct quotes and chunk ids. If there is no quotable evidence, answer exactly: Не знаю")
     }
 
-    private fun buildRequestBody(systemPrompt: String, userPrompt: String): String = buildString {
+    private fun buildRequestBody(systemPrompt: String, userPrompt: String, requestTemperature: Double): String = buildString {
         appendLine("{")
         appendLine("  \"model\": \"${JsonWriter.escape(model)}\",")
         appendLine("  \"messages\": [")
         appendLine("    {\"role\": \"system\", \"content\": \"${JsonWriter.escape(systemPrompt)}\"},")
         appendLine("    {\"role\": \"user\", \"content\": \"${JsonWriter.escape(userPrompt)}\"}")
         appendLine("  ],")
-        appendLine("  \"temperature\": $temperature,")
+        appendLine("  \"temperature\": $requestTemperature,")
         appendLine("  \"stream\": false")
         appendLine("}")
     }
